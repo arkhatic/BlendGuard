@@ -43,7 +43,8 @@ _RULES = [
     ("url",            r"https?://[^\s'\"]+", "C", "url", "Hardcoded URL"),
     ("ip",             r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "C", "ip", "Hardcoded IP address"),
     ("appdata",        r"(?i)%APPDATA%|%LOCALAPPDATA%|AppData[\\/]+Roaming", "C", "appdata", "App-data path"),
-    ("file_write",     r"\bopen\s*\([^)]*['\"](?:w|wb|a|ab)['\"]|shutil\.(?:rmtree|move)\b|\bos\.remove\s*\(", "C", "fileio", "Filesystem write or delete"),
+    ("file_write",     r"\bopen\s*\([^)]*['\"](?:w|wb|a|ab)['\"]|\.write_(?:bytes|text)\s*\(|\bos\.(?:remove|unlink|write|open)\s*\(|\bio\.open\s*\(|shutil\.(?:rmtree|move|copy\w*)\b", "C", "fileio", "Filesystem write or delete"),
+    ("script_drop",    r"\bopen\s*\(\s*['\"][^'\"\n]{0,200}\.(?:py|pyw|pyc|pth|bat|cmd|ps1|psm1|vbs|scr|sh|js|exe|dll)['\"]\s*,\s*['\"](?:w|wb|a|ab|x)|['\"][^'\"\n]{0,200}\.(?:py|pyw|pyc|pyo|pth|bat|cmd|ps1|psm1|vbs|vbe|scr|sh|js|exe|dll|command|desktop)['\"][\s\S]{0,300}?(?:\.write_(?:bytes|text)\s*\(|\bopen\s*\([^)]*['\"](?:w|wb|a|ab|x))", "S", "drop", "Writes an executable or script file (dropper)"),
     ("decode_call",    r"base64\.(?:b64decode|urlsafe_b64decode|standard_b64decode|b85decode|a85decode|b32decode)\s*\(|bytes\.fromhex\s*\(|binascii\.unhexlify\s*\(|codecs\.decode\s*\([^)]*(?:hex|rot_?13|base64|zlib|uu)", "C", "decode", "Runtime decoding"),
     ("tempfile",       r"\btempfile\.(?:NamedTemporaryFile|mkstemp|gettempdir)\b", "C", "temp", "Temp-file use"),
     ("autorun_hook",   r"bpy\.app\.handlers|@persistent\b|bpy\.app\.timers\.register", "C", "autorun", "Auto-run handler or timer"),
@@ -283,9 +284,7 @@ def scan_items(items):
     return {"severity": overall, "items": results}
 
 
-# --------------------------------------------------------------------------
 # .blend container handling (v0.3)
-# --------------------------------------------------------------------------
 def _read_blend_bytes(path, max_bytes=128 * 1024 * 1024):
     with open(path, "rb") as fh:
         raw = fh.read(max_bytes)

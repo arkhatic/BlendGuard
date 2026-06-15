@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "blendguard"
-version = "0.3.0"
+version = "0.3.1"
 name = "BlendGuard"
 tagline = "See what a .blend will auto-run before you trust it"
 maintainer = "Arkhatic <https://arkhatic.com>"
@@ -13,7 +13,7 @@ tags = ["Pipeline", "System"]
 blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
-copyright = ["2026 Your Studio"]
+copyright = ["2026 Arkhatic"]
 
 [permissions]
 files = "Read user-selected .blend files to inspect for scripts"
