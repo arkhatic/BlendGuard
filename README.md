@@ -15,6 +15,10 @@ A free, GPL, transparency-first security add-on for Blender. It shows what a fil
 - Knows the campaign tradecraft: Cloudflare Workers loaders, PowerShell `-enc`, and browser/wallet/Discord theft paths.
 - A load-time guard inspects on open and warns; a disk scan triages a file before you open it by parsing the `.blend` block structure (with a whole-file fallback), and reports `INCOMPLETE` rather than a false "clean" when it cannot fully read a compressed file.
 
+## Install
+
+Blender 4.2 LTS or newer. Edit > Preferences > Get Extensions > (dropdown) > Install from Disk, and pick the `BlendGuard-*.zip`.
+
 ## Use
 
 Keep **Auto-Run Python Scripts OFF**, open the file, and read the verdict in the BlendGuard sidebar tab (press `N`), or let the on-open guard surface it. Only enable scripts for files you have inspected and trust.

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "blendguard"
-version = "0.3.1"
+version = "0.4.1"
 name = "BlendGuard"
 tagline = "See what a .blend will auto-run before you trust it"
 maintainer = "Arkhatic <https://arkhatic.com>"

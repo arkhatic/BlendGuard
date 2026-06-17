@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # BlendGuard - transparency before trust for .blend files (inspection-only).
 #
-# Shows what a .blend would auto-run (text scripts, Python drivers, OSL script
-# nodes, handlers) without executing it, and scores the risk. Static analysis
-# only, no network access. Detection logic lives in scanner.py.
+# Reports two things, kept separate on purpose:
+#   * "What will run on open" - a neutral inventory (scripts, drivers, OSL nodes).
+#   * "Security concerns" - only genuinely meaningful capabilities, each with a
+#     plain-English explanation of when it is dangerous and when it is normal.
+# A clean file shows the inventory and "no specific security concerns".
+#
+# Static analysis only, no network. Detection lives in scanner.py.
 
 import os
 import bpy
@@ -12,26 +16,45 @@ from bpy.props import StringProperty, BoolProperty
 
 from . import scanner
 
-LAST = {"severity": None, "count": 0, "items": [], "autorun": None}
+LAST = {"severity": None, "inventory": None, "concerns": [], "autorun": None, "items": 0}
+DISK = {"name": None, "severity": None, "note": "", "concerns": []}
 
-_ICON = {
+_VERDICT_ICON = {
     scanner.CLEAN: "CHECKMARK", scanner.INFO: "INFO",
     scanner.SUSPICIOUS: "ERROR", scanner.DANGEROUS: "CANCEL",
     scanner.INCOMPLETE: "QUESTION",
 }
+_SEV_ICON = {"critical": "CANCEL", "high": "ERROR", "review": "INFO"}
+
+_INCOMPLETE_HELP = [
+    "This .blend is compressed (normal for Blender 3.0+), so it cannot be",
+    "fully read from disk without opening it. This is NOT an error and NOT",
+    "a sign of malware. To inspect it safely:",
+    "1. Keep 'Auto-Run Python Scripts' OFF (Preferences > Save & Load).",
+    "2. Open the file - with Auto-Run off, embedded scripts will NOT run.",
+    "3. Press 'Inspect This File' in this panel.",
+]
+
+
+def _clip(s, n=70):
+    s = (s or "").replace("\n", " ")
+    return s if len(s) <= n else s[:n - 1] + "…"
 
 
 class BlendGuardPrefs(bpy.types.AddonPreferences):
     bl_idname = __package__
 
-    auto_inspect: BoolProperty(name="Inspect files automatically on open", default=True)
-    warn_autorun: BoolProperty(name="Warn when Auto-Run Python Scripts is enabled", default=True)
+    inspect_on_open: BoolProperty(
+        name="Inspect automatically when a file opens",
+        description="Off by default. The recommended flow is to scan a file before opening it, "
+                    "or press Inspect manually. Enable this only if you want an automatic check on every open.",
+        default=False,
+    )
 
     def draw(self, context):
         col = self.layout.column()
-        col.prop(self, "auto_inspect")
-        col.prop(self, "warn_autorun")
-        col.separator()
+        col.prop(self, "inspect_on_open")
+        col.label(text="Recommended: keep Auto-Run Python Scripts off, and scan files before opening them.")
         col.label(text="Static analysis only. No code is executed and no network access is used.")
 
 
@@ -55,9 +78,8 @@ _NODE_COLLECTIONS = ("materials", "node_groups", "worlds", "scenes", "lights", "
 
 
 def _iter_driver_expressions():
-    data = bpy.data
     for cname in _DRIVER_COLLECTIONS:
-        coll = getattr(data, cname, None)
+        coll = getattr(bpy.data, cname, None)
         if not coll:
             continue
         for idblock in coll:
@@ -71,9 +93,8 @@ def _iter_driver_expressions():
 
 
 def _iter_osl_scripts():
-    data = bpy.data
     for cname in _NODE_COLLECTIONS:
-        coll = getattr(data, cname, None)
+        coll = getattr(bpy.data, cname, None)
         if not coll:
             continue
         for idblock in coll:
@@ -109,10 +130,15 @@ def _collect_items():
 
 
 def run_inspection(source="manual"):
-    result = scanner.scan_items(_collect_items())
-    flagged = [it for it in result["items"] if it["severity"] != scanner.CLEAN]
-    LAST.update({"severity": result["severity"], "count": len(flagged),
-                 "items": flagged[:25], "autorun": _autorun_enabled()})
+    items = _collect_items()
+    result = scanner.scan_items(items)
+    LAST.update({
+        "severity": result["severity"],
+        "inventory": scanner.will_run(items),
+        "concerns": scanner.concerns(result),
+        "autorun": _autorun_enabled(),
+        "items": len(items),
+    })
     _redraw()
     return result
 
@@ -127,28 +153,92 @@ def _redraw():
         pass
 
 
-def _popup(title, severity, lines):
+def _inventory_text():
+    inv = LAST.get("inventory") or {}
+    return "Will run on open: %d script(s), %d driver(s), %d OSL node(s)" % (
+        inv.get("scripts", 0), inv.get("drivers", 0), inv.get("osl", 0))
+
+
+def _clean_summary():
+    if LAST.get("items", 0) == 0:
+        return "No embedded scripts, drivers, or OSL nodes. Nothing will auto-run."
+    return "Inspected %d datablock(s). None execute code, reach the network, or write scripts." % LAST["items"]
+
+
+def _draw_concerns(layout, concerns):
+    for c in concerns[:10]:
+        layout.label(text=c["label"], icon=_SEV_ICON.get(c["severity"], "INFO"))
+        if c.get("danger"):
+            layout.label(text="    when it matters: " + _clip(c["danger"]), icon='NONE')
+        if c.get("legit"):
+            layout.label(text="    usually fine: " + _clip(c["legit"]), icon='NONE')
+
+
+def _popup_in_session(title):
+    sev = LAST["severity"] or scanner.CLEAN
+    concerns = LAST["concerns"]
+
     def draw(self, context):
-        for text, icon in lines:
-            self.layout.label(text=text, icon=icon)
+        layout = self.layout
+        if LAST["autorun"]:
+            layout.label(text="Auto-Run is ON - scripts run on open", icon='ERROR')
+        else:
+            layout.label(text="Auto-Run is OFF - nothing was executed", icon='CHECKMARK')
+        layout.label(text=_inventory_text(), icon='TEXT')
+        layout.separator()
+        if not concerns:
+            layout.label(text=_clean_summary(), icon='CHECKMARK')
+        else:
+            layout.label(text="Security concerns (%d):" % len(concerns), icon=_VERDICT_ICON.get(sev, "INFO"))
+            _draw_concerns(layout, concerns)
+        layout.separator()
+        layout.operator("blendguard.report_to_text", icon='TEXT')
     try:
-        bpy.context.window_manager.popup_menu(draw, title=title, icon=_ICON.get(severity, "INFO"))
+        bpy.context.window_manager.popup_menu(draw, title="%s:  %s" % (title, sev), icon=_VERDICT_ICON.get(sev, "INFO"))
     except Exception:
         pass
+
+
+def _full_report_text():
+    out = ["BlendGuard report", "=" * 40, ""]
+    out.append("IN-SESSION (current file)")
+    if LAST["severity"] is None:
+        out.append("  (not inspected yet - press 'Inspect This File')")
+    else:
+        out.append("  Verdict: %s" % LAST["severity"])
+        out.append("  Auto-Run Python Scripts: %s" % ("ON" if LAST["autorun"] else "OFF"))
+        out.append("  " + _inventory_text())
+        if not LAST["concerns"]:
+            out.append("  " + _clean_summary())
+        else:
+            out.append("  Security concerns (%d):" % len(LAST["concerns"]))
+            for c in LAST["concerns"]:
+                out.append("    - [%s] %s" % (c["severity"].upper(), c["label"]))
+                if c.get("what"):
+                    out.append("        what:   %s" % c["what"])
+                if c.get("danger"):
+                    out.append("        danger: %s" % c["danger"])
+                if c.get("legit"):
+                    out.append("        normal: %s" % c["legit"])
+    if DISK["name"]:
+        out += ["", "ON-DISK SCAN: %s" % DISK["name"], "  Verdict: %s" % DISK["severity"]]
+        if DISK["note"]:
+            out.append("  Note: %s" % DISK["note"])
+        for c in DISK["concerns"]:
+            out.append("    - [%s] %s : %s" % (c["severity"].upper(), c["label"], c.get("danger", "")))
+    out += ["", "Rule reference: docs/RULES.md", "Static analysis only. No code was executed; no network access."]
+    return "\n".join(out)
 
 
 class BLENDGUARD_OT_inspect_current(bpy.types.Operator):
     bl_idname = "blendguard.inspect_current"
     bl_label = "Inspect This File"
-    bl_description = "List embedded scripts, drivers, OSL nodes and handlers without executing them"
+    bl_description = "Show what would auto-run and any security concerns, without executing anything"
 
     def execute(self, context):
         run_inspection("manual")
+        _popup_in_session("BlendGuard")
         sev = LAST["severity"] or scanner.CLEAN
-        lines = [("Auto-Run is %s" % ("ON" if LAST["autorun"] else "OFF"),
-                  "ERROR" if LAST["autorun"] else "CHECKMARK"),
-                 ("%d flagged item(s) - %s" % (LAST["count"], sev), _ICON.get(sev, "INFO"))]
-        _popup("BlendGuard", sev, lines)
         self.report({'INFO'} if sev in (scanner.CLEAN, scanner.INFO) else {'WARNING'}, "BlendGuard: %s" % sev)
         return {'FINISHED'}
 
@@ -156,7 +246,7 @@ class BLENDGUARD_OT_inspect_current(bpy.types.Operator):
 class BLENDGUARD_OT_scan_file(bpy.types.Operator):
     bl_idname = "blendguard.scan_file"
     bl_label = "Scan a .blend on Disk"
-    bl_description = "Triage a .blend on disk for embedded scripts WITHOUT opening it"
+    bl_description = "Quick pre-check of a .blend on disk WITHOUT opening it. Compressed files cannot be fully read; for those, open with Auto-Run off and use Inspect"
 
     filepath: StringProperty(subtype='FILE_PATH')
     filter_glob: StringProperty(default="*.blend", options={'HIDDEN'})
@@ -167,13 +257,28 @@ class BLENDGUARD_OT_scan_file(bpy.types.Operator):
 
     def execute(self, context):
         res = scanner.scan_blend_file(self.filepath)
+        cons = scanner.concerns({"items": [{"name": os.path.basename(self.filepath),
+                                            "findings": res.get("findings", [])}]})
+        DISK.update({"name": os.path.basename(self.filepath), "severity": res["severity"],
+                     "note": res.get("note", ""), "concerns": cons})
         sev = res["severity"]
-        lines = [(os.path.basename(self.filepath), "FILE")]
-        if res.get("note"):
-            lines.append((res["note"][:90], "INFO"))
-        for f in res.get("findings", [])[:6]:
-            lines.append((f["desc"], "DOT"))
-        _popup("BlendGuard (disk)", sev, lines)
+
+        def draw(self, context):
+            layout = self.layout
+            layout.label(text=DISK["name"], icon='FILE_BLEND')
+            if sev == scanner.INCOMPLETE:
+                for line in _INCOMPLETE_HELP:
+                    layout.label(text=line, icon='NONE')
+            elif not cons:
+                layout.label(text="No specific security concerns", icon='CHECKMARK')
+            else:
+                layout.label(text="Security concerns (%d):" % len(cons), icon=_VERDICT_ICON.get(sev, "INFO"))
+                _draw_concerns(layout, cons)
+        try:
+            context.window_manager.popup_menu(draw, title="BlendGuard (disk):  " + sev, icon=_VERDICT_ICON.get(sev, "INFO"))
+        except Exception:
+            pass
+        _redraw()
         self.report({'INFO'} if sev in (scanner.CLEAN, scanner.INFO) else {'WARNING'}, "BlendGuard (disk): %s" % sev)
         return {'FINISHED'}
 
@@ -189,6 +294,23 @@ class BLENDGUARD_OT_disable_autorun(bpy.types.Operator):
         except Exception as exc:
             self.report({'ERROR'}, str(exc)); return {'CANCELLED'}
         _redraw(); return {'FINISHED'}
+
+
+class BLENDGUARD_OT_report_to_text(bpy.types.Operator):
+    bl_idname = "blendguard.report_to_text"
+    bl_label = "Write Full Report to Text"
+    bl_description = "Write the complete report (with every explanation) to a Text datablock you can read in the Text Editor"
+
+    def execute(self, context):
+        name = "BlendGuard Report"
+        try:
+            txt = bpy.data.texts.get(name) or bpy.data.texts.new(name)
+            txt.clear()
+            txt.write(_full_report_text())
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc)); return {'CANCELLED'}
+        self.report({'INFO'}, "Wrote '%s' - open it in the Text Editor" % name)
+        return {'FINISHED'}
 
 
 class VIEW3D_PT_blendguard(bpy.types.Panel):
@@ -212,29 +334,39 @@ class VIEW3D_PT_blendguard(bpy.types.Panel):
         col.operator("blendguard.inspect_current", icon='VIEWZOOM')
         col.operator("blendguard.scan_file", icon='FILE_FOLDER')
 
-        sev = LAST["severity"]
-        if sev is not None:
-            r = layout.box()
-            r.label(text="Last result: %s" % sev, icon=_ICON.get(sev, "INFO"))
-            if LAST["count"]:
-                r.label(text="%d flagged item(s)" % LAST["count"])
-                for it in LAST["items"][:8]:
-                    r.label(text="%s [%s]" % (it["name"], it["severity"]), icon='DOT')
+        if LAST["severity"] is not None:
+            box = layout.box()
+            box.label(text="This file: %s" % LAST["severity"], icon=_VERDICT_ICON.get(LAST["severity"], "INFO"))
+            box.label(text=_inventory_text(), icon='TEXT')
+            if not LAST["concerns"]:
+                box.label(text=_clean_summary(), icon='CHECKMARK')
+            else:
+                _draw_concerns(box, LAST["concerns"])
+            box.operator("blendguard.report_to_text", icon='TEXT')
+
+        if DISK["name"]:
+            box = layout.box()
+            box.label(text="Disk: %s  (%s)" % (DISK["name"], DISK["severity"]), icon=_VERDICT_ICON.get(DISK["severity"], "INFO"))
+            if DISK["severity"] == scanner.INCOMPLETE:
+                for line in _INCOMPLETE_HELP:
+                    box.label(text=line, icon='NONE')
+            elif not DISK["concerns"]:
+                box.label(text="No specific security concerns", icon='CHECKMARK')
+            else:
+                _draw_concerns(box, DISK["concerns"])
 
 
 @persistent
 def _on_load_post(_dummy):
     prefs = _prefs()
-    if prefs is not None and not prefs.auto_inspect:
+    if prefs is None or not prefs.inspect_on_open:
         return
     try:
-        result = run_inspection("load")
-        sev = result["severity"]
-        autorun = LAST["autorun"]
-        warn = (prefs is None) or prefs.warn_autorun
-        if sev in (scanner.SUSPICIOUS, scanner.DANGEROUS) or (autorun and warn and sev != scanner.CLEAN):
-            _popup("BlendGuard", sev, [("%d flagged item(s) - %s" % (LAST["count"], sev), _ICON.get(sev, "INFO"))])
-        print("[BlendGuard] load: severity=%s flagged=%d autorun=%s" % (sev, LAST["count"], autorun))
+        run_inspection("load")
+        sev = LAST["severity"]
+        if sev in (scanner.SUSPICIOUS, scanner.DANGEROUS) or (LAST["autorun"] and LAST["concerns"]):
+            _popup_in_session("BlendGuard")
+        print("[BlendGuard] load: severity=%s concerns=%d autorun=%s" % (sev, len(LAST["concerns"]), LAST["autorun"]))
     except Exception as exc:
         print("[BlendGuard] inspection error (ignored):", exc)
 
@@ -244,6 +376,7 @@ _classes = (
     BLENDGUARD_OT_inspect_current,
     BLENDGUARD_OT_scan_file,
     BLENDGUARD_OT_disable_autorun,
+    BLENDGUARD_OT_report_to_text,
     VIEW3D_PT_blendguard,
 )
 

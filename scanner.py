@@ -47,7 +47,6 @@ _RULES = [
     ("script_drop",    r"\bopen\s*\(\s*['\"][^'\"\n]{0,200}\.(?:py|pyw|pyc|pth|bat|cmd|ps1|psm1|vbs|scr|sh|js|exe|dll)['\"]\s*,\s*['\"](?:w|wb|a|ab|x)|['\"][^'\"\n]{0,200}\.(?:py|pyw|pyc|pyo|pth|bat|cmd|ps1|psm1|vbs|vbe|scr|sh|js|exe|dll|command|desktop)['\"][\s\S]{0,300}?(?:\.write_(?:bytes|text)\s*\(|\bopen\s*\([^)]*['\"](?:w|wb|a|ab|x))", "S", "drop", "Writes an executable or script file (dropper)"),
     ("decode_call",    r"base64\.(?:b64decode|urlsafe_b64decode|standard_b64decode|b85decode|a85decode|b32decode)\s*\(|bytes\.fromhex\s*\(|binascii\.unhexlify\s*\(|codecs\.decode\s*\([^)]*(?:hex|rot_?13|base64|zlib|uu)", "C", "decode", "Runtime decoding"),
     ("tempfile",       r"\btempfile\.(?:NamedTemporaryFile|mkstemp|gettempdir)\b", "C", "temp", "Temp-file use"),
-    ("autorun_hook",   r"bpy\.app\.handlers|@persistent\b|bpy\.app\.timers\.register", "C", "autorun", "Auto-run handler or timer"),
     ("danger_import",  r"\b(?:import|from)\s+(?:ctypes|winreg|marshal|socket)\b", "C", "dimport", "Imports a sensitive module"),
     ("osl_script",     r"ShaderNodeScript|\.osl\b|#\s*include\s*[<\"]stdosl", "C", "osl", "OSL script node"),
 
@@ -62,7 +61,7 @@ _RULES = [
     ("net_send",       r"\burlopen\s*\(|\brequests\.(?:get|post|put|head)\s*\(|\bsocket\.socket\s*\(|\.sendall\s*\(|http\.client\.HTTPS?Connection|\.connect\s*\(\s*\(", "S", "net", "Network connection"),
     ("ctypes_use",     r"\bctypes\.(?:windll|cdll|CDLL|WinDLL|cast|memmove|create_string_buffer)\b", "S", "ctypes", "Native code via ctypes"),
     ("deserialize",    r"\b(?:marshal|pickle)\.loads?\s*\(", "S", "deserial", "Deserializes code or objects"),
-    ("winreg_use",     r"(?i)winreg\.(?:OpenKey|SetValueEx|CreateKey)|reg\s+add\b", "S", "winreg", "Windows registry write"),
+    ("winreg_use",     r"(?i)winreg\.(?:SetValueEx|CreateKey\w*|DeleteKey\w*|DeleteValue|SaveKey)|reg\s+add\b", "X", "winreg", "Windows registry write"),
 
     ("obf_chr",        r"\.join\s*\([^)]{0,40}chr\s*\(|chr\s*\(\s*\w+\s*\)\s*for\s+\w+\s+in|(?:chr\s*\(\s*\d+\s*\)\s*\+?\s*){3,}", "O", "obf_chr", "Builds code from chr()"),
     ("obf_rev",        r"\[::-1\]", "O", "obf_rev", "Reversed string or bytes"),
@@ -249,16 +248,21 @@ def analyze_code(code, source="script", _depth=0, _budget=None):
     return {"findings": findings, "critical": critical, "source": source}
 
 
+_SOLO_INFO = {"net", "subprocess"}  # capabilities that need a partner to be suspicious
+
+
 def _verdict(findings, has_script, driver=False):
     cats = {f["cat"] for f in findings if f["class"] in ("S", "O")}
     crit = any(f["class"] == "X" for f in findings)
     if driver:
         return DANGEROUS if (crit or cats) else CLEAN
-    if crit or len(cats) >= 2:
+    hard = cats - _SOLO_INFO
+    n = len(cats)
+    if crit or len(hard) >= 2 or (len(hard) >= 1 and n >= 2):
         return DANGEROUS
-    if len(cats) == 1:
+    if len(hard) >= 1 or n >= 2:
         return SUSPICIOUS
-    if has_script or any(f["class"] == "C" for f in findings):
+    if n == 1 or has_script or any(f["class"] == "C" for f in findings):
         return INFO
     return CLEAN
 
@@ -284,7 +288,9 @@ def scan_items(items):
     return {"severity": overall, "items": results}
 
 
+# --------------------------------------------------------------------------
 # .blend container handling (v0.3)
+# --------------------------------------------------------------------------
 def _read_blend_bytes(path, max_bytes=128 * 1024 * 1024):
     with open(path, "rb") as fh:
         raw = fh.read(max_bytes)
@@ -375,3 +381,155 @@ def scan_blend_file(path):
     sev = _verdict(a["findings"], has_script)
     note = "" if has_script else "No embedded Python detected in static text."
     return {"path": path, "severity": sev, "note": note, "findings": a["findings"], "critical": a["critical"], "has_script": has_script}
+
+
+# ---------------------------------------------------------------------------
+# v0.4: per-finding explanations + a report split into neutral inventory and
+# real security concerns. Keyed by category. Context-class signals deliberately
+# do NOT appear here as concerns; they are normal in legitimate scripts.
+# ---------------------------------------------------------------------------
+RULE_INFO = {
+    # critical / high: rarely or never legitimate in a .blend script
+    "exfil_discord": {"sev": "critical", "label": "Discord webhook",
+        "what": "Posts data to a Discord webhook URL.",
+        "danger": "Webhooks are a standard data-exfiltration channel; a scene file has no reason to call Discord's message API.",
+        "legit": "Effectively never in a .blend script."},
+    "exfil_tg": {"sev": "critical", "label": "Telegram bot API",
+        "what": "Talks to the Telegram bot API.",
+        "danger": "Common exfiltration / C2 channel.",
+        "legit": "Effectively never in a .blend script."},
+    "loader_cf": {"sev": "critical", "label": "Cloudflare Workers loader",
+        "what": "Fetches from a *.workers.dev URL.",
+        "danger": "Workers domains are a frequent malware staging/loader host in current campaigns.",
+        "legit": "Rare. A few tools legitimately use Workers, so treat as a strong hint, not proof."},
+    "persist": {"sev": "critical", "label": "Persistence mechanism",
+        "what": "Touches an OS autostart location (Run key, Startup folder, launchd, cron).",
+        "danger": "Establishing persistence is malware behaviour, not something a 3D file does.",
+        "legit": "None in this context."},
+    "stealer": {"sev": "critical", "label": "Credential/wallet path",
+        "what": "References a browser, credential, or wallet store (leveldb, Login Data, wallet.dat, Firefox profiles).",
+        "danger": "These are exactly the files infostealers read.",
+        "legit": "None in a .blend script."},
+    "winreg": {"sev": "high", "label": "Windows registry write",
+        "what": "Writes to the Windows registry (SetValueEx / CreateKey / reg add).",
+        "danger": "A scene file writing the registry is never legitimate; used for persistence or config tampering.",
+        "legit": "Reading a key can be benign, but this rule targets writes specifically."},
+    "decoded": {"sev": "critical", "label": "Obfuscated payload",
+        "what": "An encoded blob in the file decodes to code that itself contains dangerous calls.",
+        "danger": "Layered encoding exists to hide a payload from inspection; a blob that unpacks to exec/os/network is a strong malware sign.",
+        "legit": "Almost none."},
+
+    # review: real capabilities, often legitimate. Surfaced with context, not condemned.
+    "dynexec": {"sev": "review", "label": "Dynamic code execution (exec/eval)",
+        "what": "Runs code assembled at runtime via exec() or eval().",
+        "danger": "The usual way an obfuscated or fetched payload is executed.",
+        "legit": "Some advanced tools metaprogram or evaluate user expressions. Uncommon but not malicious by itself."},
+    "dynimport": {"sev": "review", "label": "Dynamic __import__()",
+        "what": "Imports a module whose name is computed at runtime.",
+        "danger": "Used to hide which module is in play (e.g. os, socket) from a scanner.",
+        "legit": "Rare in normal add-ons; common in obfuscators and plugin loaders."},
+    "import_call": {"sev": "review", "label": "Call on an __import__ result",
+        "what": "Imports a module by name and immediately calls into it.",
+        "danger": "A compact way to call os/subprocess without writing the names plainly.",
+        "legit": "Uncommon outside obfuscation."},
+    "getattr_import": {"sev": "review", "label": "getattr against __import__",
+        "what": "Reaches into a dynamically imported module via getattr.",
+        "danger": "Indirection used to evade name-based detection.",
+        "legit": "Rare."},
+    "os_exec": {"sev": "review", "label": "Executes via os",
+        "what": "Runs a program via os.system / os.popen / os.startfile.",
+        "danger": "Direct command execution; dangerous if the command is built from untrusted input.",
+        "legit": "Occasionally used to open a file or launch a helper. Look at what it runs."},
+    "subprocess": {"sev": "review", "label": "Spawns a subprocess",
+        "what": "Runs an external program.",
+        "danger": "Command execution; concerning when the command is attacker-controlled or fed by network/obfuscation.",
+        "legit": "Legitimate and common: invoking ffmpeg, renderers, exporters, compilers. Pipeline tools do this constantly. Read WHAT it runs before worrying."},
+    "shell": {"sev": "review", "label": "Shell invocation",
+        "what": "Invokes a shell (powershell, cmd, /bin/sh).",
+        "danger": "Shell one-liners are a common malware execution method.",
+        "legit": "Rare in add-ons; usually worth a look."},
+    "psenc": {"sev": "review", "label": "PowerShell encoded command",
+        "what": "Uses -EncodedCommand or FromBase64String.",
+        "danger": "Encoded PowerShell exists almost exclusively to hide a command.",
+        "legit": "None expected in a .blend."},
+    "net": {"sev": "review", "label": "Network connection",
+        "what": "Opens a network connection (urlopen / requests / socket).",
+        "danger": "Needed to exfiltrate data or pull a second stage; matters most alongside credential/file access or obfuscation.",
+        "legit": "Very common and legitimate: update checks, fetching assets, license validation, API calls. A URL whose response you decode is normal. Network access alone is not malware."},
+    "ctypes": {"sev": "review", "label": "Native code via ctypes",
+        "what": "Calls into native libraries through ctypes.",
+        "danger": "Lets Python run arbitrary native code or shellcode.",
+        "legit": "Some hardware or OS-integration add-ons use ctypes. Uncommon but real."},
+    "deserial": {"sev": "review", "label": "marshal/pickle.loads",
+        "what": "Deserializes objects with pickle or marshal.",
+        "danger": "Deserializing untrusted data can execute code.",
+        "legit": "Some tools cache state with pickle. A risky pattern, not always malicious."},
+    "drop": {"sev": "review", "label": "Writes an executable/script file",
+        "what": "Writes a file whose name is a script or executable (.py, .pth, .bat, .ps1, .exe...).",
+        "danger": "Dropping a program to disk is a stager move; a .pth into site-packages auto-runs on the next Python start.",
+        "legit": "Uncommon. Some code generators emit .py files. Worth a look, not proof of malice."},
+    "obf_chr": {"sev": "review", "label": "Code built from chr()",
+        "what": "Assembles strings from chr() arithmetic or character lists.",
+        "danger": "A way to spell a forbidden token without writing it.",
+        "legit": "Almost none; occasionally minification."},
+    "obf_rev": {"sev": "review", "label": "Reversed string/bytes",
+        "what": "Reverses a string or byte sequence at runtime.",
+        "danger": "Used to hide a literal from inspection.",
+        "legit": "Rare."},
+    "obf_entropy": {"sev": "review", "label": "High-entropy blob",
+        "what": "Contains a long, high-randomness encoded-looking string.",
+        "danger": "Often a packed payload that could not be decoded.",
+        "legit": "Occasionally embedded binary data (an icon, a font). Context-dependent."},
+
+    # informational: normal in legitimate scripts. Never shown as concerns.
+    "url": {"sev": "info", "label": "Hardcoded URL", "what": "Contains a URL.",
+        "danger": "None by itself.", "legit": "Docs links, update checks, asset and API endpoints. Completely normal."},
+    "ip": {"sev": "info", "label": "Hardcoded IP", "what": "Contains an IP address.",
+        "danger": "None by itself.", "legit": "Normal for self-hosted services or LAN tools."},
+    "appdata": {"sev": "info", "label": "App-data path", "what": "References an app-data folder.",
+        "danger": "None by itself.", "legit": "Add-ons store config and caches there routinely."},
+    "fileio": {"sev": "info", "label": "Writes a file", "what": "Writes or deletes a file.",
+        "danger": "None by itself.", "legit": "Every exporter writes files. Only writing an executable (see drop) is treated as a concern."},
+    "decode": {"sev": "info", "label": "Runtime decoding", "what": "Decodes base64/hex at runtime.",
+        "danger": "None by itself.", "legit": "Decoding an embedded icon, parsing an API response, unpacking data. Only matters if what is decoded is itself code, which the engine checks separately."},
+    "temp": {"sev": "info", "label": "Temp file", "what": "Uses a temporary file.",
+        "danger": "None.", "legit": "Ubiquitous and harmless."},
+    "dimport": {"sev": "info", "label": "Imports a sensitive module", "what": "Imports ctypes/winreg/marshal/socket.",
+        "danger": "None by itself; the import only matters if the module is actually used dangerously.", "legit": "Plenty of tools import socket or ctypes for benign reasons."},
+    "osl": {"sev": "info", "label": "OSL script node", "what": "Contains an OSL shader script node.",
+        "danger": "Low; OSL is far more constrained than Python.", "legit": "Normal in advanced shading setups."},
+}
+
+
+def _rank(sev):
+    return {"critical": 0, "high": 1, "review": 2, "info": 3}.get(sev, 4)
+
+
+def concerns(scan_result):
+    """Return only the security-relevant findings (strong/critical), de-duplicated
+    by category and enriched with plain-English explanations. Context-class
+    signals are intentionally excluded; they are normal in legitimate scripts."""
+    out, seen = [], set()
+    for it in scan_result.get("items", []):
+        for f in it.get("findings", []):
+            if f.get("class") in ("S", "O", "X") and f.get("cat") not in seen:
+                seen.add(f.get("cat"))
+                info = RULE_INFO.get(f.get("cat"), {})
+                out.append({
+                    "cat": f.get("cat"),
+                    "severity": info.get("sev", "review"),
+                    "label": info.get("label", f.get("desc", "")),
+                    "what": info.get("what", ""),
+                    "danger": info.get("danger", ""),
+                    "legit": info.get("legit", ""),
+                    "where": it.get("name", ""),
+                })
+    out.sort(key=lambda c: _rank(c["severity"]))
+    return out
+
+
+def will_run(items):
+    """Neutral inventory of what would auto-run on open. Not a threat assessment."""
+    kind = lambda k: sum(1 for i in items if i.get("kind") == k)
+    return {"scripts": kind("text"), "drivers": kind("driver"), "osl": kind("osl"),
+            "registered": sum(1 for i in items if i.get("registered"))}
